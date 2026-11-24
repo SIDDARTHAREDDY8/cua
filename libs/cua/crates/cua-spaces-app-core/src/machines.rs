@@ -28,10 +28,10 @@
 //!
 //! [`page_rows`] is the whole Machines page from what a shell has: this
 //! machine, the machines its Spaces list shows (a machine sharing its own
-//! desktop, `relay:<machine>`, and a machine that provides Spaces), what
-//! the relay says of each, and the account's devices, merged. Every UI
-//! (the SwiftUI app, the web UI in the Mac app and in Electron) lists
-//! these rows.
+//! desktop, `relay:<machine>`, a machine that provides Spaces, and a
+//! direct host that provides Spaces), what the relay says of each, and
+//! the account's devices, merged. Every UI (the SwiftUI app, the web UI
+//! in the Mac app and in Electron) lists these rows.
 
 use std::collections::HashMap;
 
@@ -357,7 +357,8 @@ pub struct MachinePageRow {
     pub online: bool,
     /// `macos`, `linux`, `windows`, or empty when unknown.
     pub os: String,
-    /// `local` (this machine) or `relay`.
+    /// `local` (this machine), `relay`, or `direct` (a host added by
+    /// address that provides Spaces).
     pub via: String,
     /// The machine this app runs on.
     pub current: bool,
@@ -455,6 +456,10 @@ fn shares_own_desktop(spaces: &[Space], space_id: Option<&str>, current: bool, l
     let Some(entry) = space_id.and_then(|id| spaces.iter().find(|s| s.id == id)) else {
         return false;
     };
+    // A direct host's record is the host, not a desktop it shares.
+    if entry.provider == Some(SpaceProvider::Direct) {
+        return false;
+    }
     live && if current {
         entry.status == SpaceStatus::Local
     } else {
@@ -493,6 +498,22 @@ fn own_desktop(space: &Space) -> Option<&str> {
         .id
         .strip_prefix("relay:")
         .filter(|own| !own.is_empty() && !own.contains('/') && !own.starts_with("space-"))
+}
+
+/// The registered name of a direct host `space` is, when it is one: a
+/// Space added by address (`direct:<addr>`, no host above it) whose
+/// spacesd advertises `host_spaces`. That name is what
+/// `on="host:<name>"` takes. A direct Space without the feature is a
+/// Space added by address, not a computer.
+fn direct_host(space: &Space) -> Option<&str> {
+    if space.provider != Some(SpaceProvider::Direct)
+        || space.host.is_some()
+        || !crate::spaces::has_feature(space, crate::spaces::sidebar::HOST_SPACES_FEATURE)
+    {
+        return None;
+    }
+    let name = space.name.trim();
+    (!name.is_empty()).then_some(name)
 }
 
 /// A Space's system as a machine's `os`: empty when unknown, so it never
@@ -554,6 +575,40 @@ pub fn page_rows(input: &MachinesPageInput) -> Vec<MachinePageRow> {
                 listed_offline: says_listed_offline(space),
             };
             match machines.iter().position(|m| m.id == own) {
+                Some(i) if !machines[i].current => {
+                    machines[i] = row;
+                    extra[i] = e;
+                }
+                Some(_) => {}
+                None => {
+                    machines.push(row);
+                    extra.push(e);
+                }
+            }
+            continue;
+        }
+        if let Some(host) = direct_host(space) {
+            // A direct host that provides Spaces is a computer of its
+            // own (its registered name is what `on="host:<name>"`
+            // takes), not a Space: the Computers page lists it, and New
+            // Space offers it as a run target.
+            let stopped = says_stopped_sharing(space);
+            let online =
+                matches!(space.status, SpaceStatus::Running | SpaceStatus::Local) || stopped;
+            let row = MachineIn {
+                id: host.into(),
+                name: space.name.clone(),
+                online,
+                os: os_word(space.os),
+                ..Default::default()
+            };
+            let e = Extra {
+                via: "direct",
+                space_id: Some(space.id.clone()),
+                stopped_sharing: stopped,
+                listed_offline: says_listed_offline(space),
+            };
+            match machines.iter().position(|m| m.id == host) {
                 Some(i) if !machines[i].current => {
                     machines[i] = row;
                     extra[i] = e;
@@ -1037,6 +1092,21 @@ mod tests {
         })
     }
 
+    fn direct_host(name: &str, features: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "id": "direct:10.0.0.9:3211", "name": name, "os": "linux",
+            "status": "running", "provider": "direct",
+            "sdk": {"features": features, "spacesdVersion": "", "reachable": true}
+        })
+    }
+
+    fn direct_hosted(name: &str, n: u32, status: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": format!("direct:10.0.0.9:41{n:03}"), "name": format!("s{n}"),
+            "status": status, "provider": "direct", "host": name
+        })
+    }
+
     fn this_mac_space(status: &str) -> serde_json::Value {
         serde_json::json!({"id": "this-mac", "name": "This Mac", "os": "macos", "status": status})
     }
@@ -1108,6 +1178,118 @@ mod tests {
             ),
             (1, "1 Space".into())
         );
+    }
+
+    /// trycua/cua#8548: a direct host registered with `--host` advertises
+    /// `host_spaces`, so the Computers page lists it as a computer and
+    /// New Space offers it as a run target (`host:<name>`). A direct
+    /// Space that provides no Spaces stays a Space.
+    #[test]
+    fn a_direct_host_that_provides_spaces_is_a_computer_and_a_run_on_choice() {
+        let rows = page_rows(&MachinesPageInput {
+            spaces: vec![space(direct_host("example-linux-host", &["host_spaces"]))],
+            now: NOW,
+            ..Default::default()
+        });
+        assert_eq!(rows.len(), 2);
+        let r = &rows[1];
+        assert_eq!(
+            (
+                r.id.as_str(),
+                r.name.as_str(),
+                r.via.as_str(),
+                r.online,
+                r.os.as_str(),
+                r.space_id.as_deref(),
+                r.device_only,
+                r.status.as_str(),
+                r.spaces,
+                r.spaces_label.as_str(),
+            ),
+            (
+                "example-linux-host",
+                "example-linux-host",
+                "direct",
+                true,
+                "linux",
+                Some("direct:10.0.0.9:3211"),
+                false,
+                ONLINE,
+                0,
+                "No Spaces",
+            ),
+        );
+        assert_eq!(run_on_ids(&merge_rows(&rows)), ["example-linux-host"]);
+        // Its Spaces count, and an offline one still lists, offline.
+        assert_eq!(
+            label_of(
+                vec![
+                    direct_host("example-linux-host", &["host_spaces"]),
+                    direct_hosted("example-linux-host", 1, "running"),
+                ],
+                "example-linux-host",
+            ),
+            (1, "1 Space".into())
+        );
+        let mut off = direct_host("example-linux-host", &["host_spaces"]);
+        off["status"] = "suspended".into();
+        let rows = page_rows(&MachinesPageInput {
+            spaces: vec![space(off)],
+            now: NOW,
+            ..Default::default()
+        });
+        assert_eq!((rows[1].online, rows[1].status.as_str()), (false, OFFLINE));
+        // No `host_spaces`: an ordinary Space added by address, no row.
+        let rows = page_rows(&MachinesPageInput {
+            spaces: vec![space(direct_host("plain-box", &[]))],
+            now: NOW,
+            ..Default::default()
+        });
+        assert_eq!(rows.len(), 1);
+        // The picker offers it: the wizard's env hosts come from these
+        // rows, and `host:<name>` is what the create takes.
+        use crate::model::Location;
+        use crate::wizard::{self, SpaceHost, WizardEnv};
+        let rows = page_rows(&MachinesPageInput {
+            spaces: vec![space(direct_host("example-linux-host", &["host_spaces"]))],
+            now: NOW,
+            ..Default::default()
+        });
+        let env = WizardEnv {
+            hosts: rows
+                .iter()
+                .filter(|r| run_on_ids(&merge_rows(&rows)).contains(&r.id))
+                .map(|r| SpaceHost {
+                    id: r.id.clone(),
+                    name: r.name.clone(),
+                    via: r.via.clone(),
+                    online: r.online,
+                    os: r.os.clone(),
+                    limits: vec![],
+                    load: None,
+                })
+                .collect(),
+            default_location: Location::Local,
+            local_available: true,
+            local_reason: None,
+            local_backends: Some(vec!["docker".into()]),
+            local_details: None,
+            max_cpus: 8,
+            host_arch: Some("arm64".into()),
+            lume_source: None,
+            linux_source: None,
+            storage: None,
+            clouds: vec![],
+            experiments: crate::experiments::Experiments::default(),
+            gpus: None,
+            name_seed: None,
+        };
+        let state = wizard::initial(&env);
+        let offered: Vec<String> = wizard::placement_options(&state, &env)
+            .into_iter()
+            .filter_map(|o| o.id.strip_prefix("host:").map(str::to_string))
+            .collect();
+        assert_eq!(offered, ["example-linux-host"]);
     }
 
     #[test]

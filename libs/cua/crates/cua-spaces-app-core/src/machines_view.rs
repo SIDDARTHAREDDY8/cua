@@ -603,13 +603,22 @@ pub fn view(input: &MachinesViewInput) -> MachinesView {
                 share: host.is_some_and(|s| live(s) && s.share_desktop),
             }
         } else {
+            // A direct host's own record says it provides Spaces even
+            // with none yet: its `host_spaces` feature, not the Spaces
+            // it has. It shares no desktop through that record.
+            let provides = own_space.is_some_and(|s| {
+                crate::spaces::has_feature(s, crate::spaces::sidebar::HOST_SPACES_FEATURE)
+            });
             Switches {
                 provide: !row.device_only
-                    && relay
-                        .and_then(|r| r.provides_spaces)
-                        .unwrap_or(!on.is_empty()),
-                share: own_space
-                    .is_some_and(|s| crate::spaces::sidebar::shares_desktop(s) != Some(false)),
+                    && (provides
+                        || relay
+                            .and_then(|r| r.provides_spaces)
+                            .unwrap_or(!on.is_empty())),
+                share: own_space.is_some_and(|s| {
+                    s.provider != Some(SpaceProvider::Direct)
+                        && crate::spaces::sidebar::shares_desktop(s) != Some(false)
+                }),
             }
         };
         let live = row.online && !stopped && !svc_down;
@@ -857,6 +866,10 @@ pub fn view(input: &MachinesViewInput) -> MachinesView {
         }
 
         let remove = if team {
+            None
+        } else if row.via == "direct" {
+            // A host added by address is forgotten from its Space, not
+            // through the relay.
             None
         } else if row.current {
             host.filter(|s| s.configured).map(|_| MachinesViewRemove {
@@ -1618,6 +1631,14 @@ mod tests {
         })
     }
 
+    fn direct_host(name: &str, features: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "id": "direct:10.0.0.9:3211", "name": name, "os": "linux",
+            "status": "running", "provider": "direct",
+            "sdk": {"features": features, "spacesdVersion": "", "reachable": true}
+        })
+    }
+
     fn this_mac(status: &str) -> serde_json::Value {
         serde_json::json!({"id": "this-mac", "name": "This Mac", "os": "macos", "status": status})
     }
@@ -1682,6 +1703,32 @@ mod tests {
         assert!(m.desktop.is_none() && m.spaces_empty.is_none());
         let v = view_of(vec![this_mac("local")], vec![], Some(host(true, false)));
         assert_eq!(by_id(&v, "this-mac").line, "Ready for Spaces");
+    }
+
+    /// trycua/cua#8548: a direct host that provides Spaces is a computer
+    /// with New Space on it ("Direct", no desktop, no relay removal),
+    /// even with no Spaces on it yet.
+    #[test]
+    fn a_direct_host_that_provides_spaces_offers_new_space_on_it() {
+        let v = view_of(
+            vec![direct_host("example-linux-host", &["host_spaces"])],
+            vec![],
+            None,
+        );
+        let m = by_id(&v, "example-linux-host");
+        assert_eq!(m.line, "Ready for Spaces");
+        assert!(m.desktop.is_none());
+        assert!(m.new_space.enabled);
+        assert_eq!(m.new_space.on, "host:example-linux-host");
+        assert!(m.remove.is_none());
+        assert!(m.rename.is_none());
+        assert_eq!(
+            m.details
+                .iter()
+                .find(|f| f.label == "Connection")
+                .map(|f| f.value.as_str()),
+            Some("Direct")
+        );
     }
 
     /// The page rows get no host settings, so for this machine a host set
